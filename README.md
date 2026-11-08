@@ -66,7 +66,7 @@ cd FuckLMS
 
 Готовый APK появится в `app/build/outputs/apk/debug/app-debug.apk` — скопируйте его на телефон и установите, разрешив установку из неизвестных источников. Либо просто откройте проект в Android Studio и нажмите **Run ▶**.
 
-Для полноценной работы также разверните сервис (каталог `server/`, Go + PostgreSQL) — инструкция появится вместе с кодом сервиса; архитектурное решение описано в [docs/adr/0001-go-attendance-service.md](docs/adr/0001-go-attendance-service.md).
+Для полноценной работы также разверните сервис (каталог [`server/`](server/README.md), Go + PostgreSQL) — инструкции по запуску и переменные окружения в [`server/README.md`](server/README.md); архитектурное решение описано в [docs/adr/0001-go-attendance-service.md](docs/adr/0001-go-attendance-service.md).
 
 ## Приватность
 

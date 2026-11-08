@@ -1,0 +1,71 @@
+# FuckLMS attendance service
+
+Go-сервис, который хранит студентов в PostgreSQL и выполняет отметку посещаемости
+в Moodle LMS ([lms.uni-dubna.ru](https://lms.uni-dubna.ru)) параллельно для списка
+студентов. Контракт API — [`../docs/openapi.yaml`](../docs/openapi.yaml), архитектурное
+решение — [`../docs/adr/0001-go-attendance-service.md`](../docs/adr/0001-go-attendance-service.md).
+
+## Сборка и запуск
+
+Нужен Go 1.22+ (используются роуты `GET /path` и `{id}` в `net/http`).
+
+```bash
+go build ./...        # сборка
+go vet ./...          # статический анализ
+go build -o fucklms-server .
+```
+
+## Конфигурация (переменные окружения)
+
+| Переменная | Обязательна | По умолчанию | Описание |
+|---|---|---|---|
+| `TOKEN` | да | — | bearer-токен для всех ручек, кроме `/health` |
+| `DATABASE_URL` | да | — | строка подключения к PostgreSQL (`postgres://user:pass@host:port/db`) |
+| `PORT` | нет | `:8080` | адрес HTTP-сервера |
+| `MARK_CONCURRENCY` | нет | `5` | сколько студентов отмечать параллельно |
+| `LMS_BASE_URL` | нет | `https://lms.uni-dubna.ru` | базовый URL Moodle |
+
+## Миграция
+
+Схема применяется вручную (миграционного фреймворка нет):
+
+```bash
+psql "$DATABASE_URL" -f migrations/0001_init.sql
+```
+
+## Быстрая проверка
+
+```bash
+curl http://localhost:8080/health
+# {"database":"up","status":"ok"}
+
+curl -X POST http://localhost:8080/api/students \
+  -H 'Authorization: Bearer <TOKEN>' \
+  -d '{"firstName":"Иван","lastName":"Иванов","studyGroup":"101-А","lmsLogin":"ivanov","lmsPassword":"secret"}'
+
+# SSE-поток результатов (Ctrl+C — просто закрыть соединение, отметки продолжатся)
+curl -N -X POST http://localhost:8080/api/mark \
+  -H 'Authorization: Bearer <TOKEN>' \
+  -d '{"qrUrl":"https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid=123&qrpass=abc"}'
+```
+
+Без `studentIds` отмечаются все студенты с `isSelected = true`.
+
+## Структура
+
+| Файл | Содержимое |
+|---|---|
+| `main.go` | сборка: конфиг, пул БД, роуты, мягкое завершение по SIGINT/SIGTERM |
+| `config.go` | чтение и валидация переменных окружения |
+| `store.go` | доступ к PostgreSQL (`jackc/pgx/v5`), CRUD студентов, валидация |
+| `api.go` | HTTP-обработчики: health, CRUD, bearer-авторизация |
+| `mark.go` | `POST /api/mark`: разбор QR-ссылки, пул воркеров, SSE-стрим |
+| `lms.go` | клиент Moodle: логин (`logintoken`), отметка (`sesskey`, выбор статуса по подписи) |
+| `migrations/0001_init.sql` | таблица `students` |
+
+## Безопасность
+
+- `lms_password` хранится в БД **открытым текстом** — осознанное решение ADR 0001.
+  Ограничьте доступ к хосту и БД; пароли никогда не возвращаются API.
+- Токен сравнивается в постоянном времени (`subtle.ConstantTimeCompare`).
+- `qrUrl` принимается только с host'ом `LMS_BASE_URL`.
