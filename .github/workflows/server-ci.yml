@@ -1,0 +1,105 @@
+name: CI server
+
+on:
+  push:
+    branches: ["dev"]
+    paths:
+      - 'server/**'
+      - '.github/workflows/server-ci.yml'
+  pull_request:
+    branches: ["dev"]
+    paths:
+      - 'server/**'
+      - '.github/workflows/server-ci.yml'
+
+defaults:
+  run:
+    working-directory: './server'
+
+jobs:
+
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Клонируем репозиторий
+      - name: Checkout service code
+        uses: actions/checkout@v7
+
+      # 2. Устанавливаем Go и включаем кэширования зависимостей
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+          # go.sum лежит в server/, без этого пути setup-go не найдёт его и кэш не заработает
+          cache-dependency-path: server/go.sum
+
+      # 3. Проверка зависимостей и сборка
+      - name: Install dependencies
+        run: go mod download
+
+      # 3.5 Запуск линтера
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.15
+          working-directory: './server'
+
+      # 4. Запуск тестов
+      - name: Run tests with coverage
+        run: go test -v -coverprofile=coverage.out ./...
+
+      # 5. Проверяем, что общее покрытие кода >= 90%
+      - name: Check code coverage threshold
+        run: |
+          TOTAL_COVERAGE=$(go tool cover -func=coverage.out | grep total: | awk '{print $3}' | sed 's/%//')
+
+          echo "Current code coverage: ${TOTAL_COVERAGE}%"
+
+          awk -v cov="$TOTAL_COVERAGE" -v min="90.0" 'BEGIN {
+              if (cov < min) {
+                  print "❌ Error: Code coverage is " cov "%, which is below the required " min "%."
+                  exit 1
+              } else {
+                  print "✅ Success: Code coverage " cov "% meets the requirement (" min "%)."
+              }
+          }'
+
+  build-and-push:
+    # Образ публикуем только после зелёных lint/test и только на push в dev:
+    # публикация из PR перезаписывала бы тег latest до мерджа.
+    needs: lint-and-test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # 1. Логинимся в ghcr.io с помощью встроенного токена
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # 2. Собираем и пушим (build-push-action НЕ приводит теги к нижнему регистру —
+      # владелец репозитория обязан быть в нижнем регистре, иначе пуш упадёт)
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./server
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/fucklms-server:latest
+            ghcr.io/${{ github.repository_owner }}/fucklms-server:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
