@@ -91,7 +91,7 @@ func (c *lmsClient) get(ctx context.Context, urlStr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := readBody(resp)
 	if err != nil {
 		return "", err
@@ -118,7 +118,7 @@ func (c *lmsClient) postForm(ctx context.Context, urlStr string, form url.Values
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := readBody(resp)
 	if err != nil {
 		return "", err
