@@ -19,18 +19,38 @@
 
 ## Архитектура — неочевидные факты
 
-- Единственный модуль `:app`. Входная точка — `MainActivity.kt`, в нём же все три Compose-экрана: `ScannerScreen` (CameraX + ML Kit), `BrowserScreen` (WebView), `AccountsScreen`.
-- **`MoodleClient.kt` и `QrParser.parseQrUrl()` к UI не подключены.** Рабочий механизм — `BrowserScreen()`: WebView с JS-инъекциями. Не «чинить» MoodleClient как главный путь и не считать его мёртвым кодом для удаления без вопроса — он задокументирован как вспомогательный.
-- В JS `BrowserScreen` зашита константа успеха `view.php?id=122864&success=true` — переход на неё переводит поток в ветку успеха. База LMS: `https://lms.uni-dubna.ru` захардкожена в `MoodleClient` и `MainActivity`.
-- Пароль QR в UI извлекает `parseQrPassword()` из `MainActivity.kt` (только параметр `qrpass`). `QrParser` понимает `qrpass`/`password`/`studentpassword`, но не вызывается.
-- Аккаунты: `AccountManager` → `EncryptedSharedPreferences` (`secure_accounts_prefs`, ключ `accounts_list`), JSON `{login, password, isSelected}`. **Миграций нет** — смена схемы данных ломает сохранённые аккаунты.
-- `minSdk = 24` — используемые API должны существовать с Android 7.0.
+- Два компонента: Android-приложение (`:app`) и **Go-сервис** (`server/`, PostgreSQL —
+  таблица `students`). Приложение общается **только с сервисом** (JSON + SSE,
+  bearer-токен); всю работу с Moodle LMS (`https://lms.uni-dubna.ru`, захардкожен в
+  `server/lms.go` и `server/config.go`) делает сервис. Контракт API — `docs/openapi.yaml`,
+  решение — `docs/adr/0001-go-attendance-service.md`.
+- Входная точка — `MainActivity.kt`, три Compose-экрана: `ScannerScreen` (CameraX + ML Kit,
+  без изменений), `MarkingScreen` (POST `/api/mark` + чтение SSE-потока через OkHttp),
+  `AccountsScreen` (CRUD студентов через API + карточка настроек сервиса).
+- `ServiceClient.kt` — весь сетевой слой приложения: `ServiceSettings` (адрес + токен в
+  `EncryptedSharedPreferences`, файл `secure_service_prefs`) и `ServiceClient` (OkHttp,
+  ручной разбор SSE-строк `event:`/`data:`). Пароли студентов в приложении не хранятся
+  и не отображаются.
+- Удалено в рамках ADR 0001: WebView-ветка `BrowserScreen` с JS-инъекциями,
+  `MoodleClient.kt`, `AccountManager` и файл `secure_accounts_prefs` — **не
+  восстанавливать без нового ADR**. Старые сохранённые на устройствах аккаунты
+  не мигрируют (по решению — заново вносятся в БД сервиса).
+- `QrParser.parseQrUrl()` по-прежнему **не подключён к UI**: сканер передаёт сырую
+  QR-ссылку целиком, `sessid`/`qrpass` разбирает сервис (`server/mark.go`,
+  приоритет `qrpass` → `password` → `studentpassword`).
+- Манифест включает `android:usesCleartextTraffic="true"` — сервис в LAN обычно по http.
+- Механика Moodle на сервисе: логин через скрытое поле `logintoken`, отметка через
+  `sesskey` + выбор радиокнопки статуса **по подписи** (хардкод `status=1` запрещён);
+  «уже была отмечена» → статус `already` (успех). Константа
+  `view.php?id=122864&success=true` больше нигде не используется.
+- `minSdk = 24` в `:app` — используемые API должны существовать с Android 7.0.
 
 ## Сборка и проверка
 
 ```bash
 ./gradlew assembleDebug          # основная проверка; APK: app/build/outputs/apk/debug/app-debug.apk
 ./gradlew :app:compileDebugKotlin  # быстрый чек компиляции без упаковки
+cd server && go build ./... && go vet ./...  # проверка Go-сервиса
 ```
 
 - Нужен **JDK 17+** (AGP 9.x); Android SDK через `local.properties` или `ANDROID_HOME`.

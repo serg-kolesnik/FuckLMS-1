@@ -5,7 +5,6 @@ import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
-import android.webkit.*
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,6 +20,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,6 +30,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -40,7 +42,7 @@ import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var accountManager: AccountManager
+    private lateinit var serviceSettings: ServiceSettings
 
     private val cameraPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -48,7 +50,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        accountManager = AccountManager(this)
+        serviceSettings = ServiceSettings(this)
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
@@ -56,7 +58,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MaterialTheme {
-                MainAppScreen(accountManager)
+                MainAppScreen(serviceSettings)
             }
         }
     }
@@ -64,7 +66,7 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainAppScreen(accountManager: AccountManager) {
+fun MainAppScreen(serviceSettings: ServiceSettings) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var scannedUrl by remember { mutableStateOf("") }
 
@@ -74,8 +76,8 @@ fun MainAppScreen(accountManager: AccountManager) {
                 Text(
                     when (selectedTab) {
                         0 -> "Сканер LMS"
-                        1 -> "Встроенный браузер"
-                        else -> "Мои аккаунты"
+                        1 -> "Отметка посещаемости"
+                        else -> "Студенты"
                     }
                 )
             })
@@ -91,8 +93,8 @@ fun MainAppScreen(accountManager: AccountManager) {
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    icon = { Text("🌐") },
-                    label = { Text("Браузер") }
+                    icon = { Text("✅") },
+                    label = { Text("Отметка") }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 2,
@@ -106,21 +108,13 @@ fun MainAppScreen(accountManager: AccountManager) {
         Box(modifier = Modifier.padding(paddingValues)) {
             when (selectedTab) {
                 0 -> ScannerScreen(
-                    accountManager = accountManager,
                     onQrScanned = { url ->
                         scannedUrl = url
                         selectedTab = 1
                     }
                 )
-                1 -> {
-                    // ИЗМЕНЕНИЕ: Передаем в браузер только ВЫБРАННЫЕ аккаунты
-                    val selectedAccounts = accountManager.getAccounts().filter { it.isSelected }
-                    BrowserScreen(
-                        url = scannedUrl,
-                        accounts = selectedAccounts.map { Pair(it.login, it.password) } // Конвертируем для браузера
-                    )
-                }
-                2 -> AccountsScreen(accountManager)
+                1 -> MarkingScreen(serviceSettings, scannedUrl)
+                2 -> AccountsScreen(serviceSettings)
             }
         }
     }
@@ -128,7 +122,7 @@ fun MainAppScreen(accountManager: AccountManager) {
 
 @OptIn(ExperimentalGetImage::class)
 @Composable
-fun ScannerScreen(accountManager: AccountManager, onQrScanned: (String) -> Unit) {
+fun ScannerScreen(onQrScanned: (String) -> Unit) {
     val context = LocalContext.current
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
     val executor = remember { Executors.newSingleThreadExecutor() }
@@ -184,223 +178,389 @@ fun ScannerScreen(accountManager: AccountManager, onQrScanned: (String) -> Unit)
     }
 }
 
-// ================== БРАУЗЕР ==================
-@SuppressLint("SetJavaScriptEnabled")
+// ================== ОТМЕТКА ==================
+
 @Composable
-fun BrowserScreen(url: String, accounts: List<Pair<String, String>>) {
-    if (url.isEmpty() || accounts.isEmpty()) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text(
-                text = if (url.isEmpty()) "Отсканируйте QR-код" else "Нет выбранных аккаунтов!",
-                style = MaterialTheme.typography.bodyLarge,
-                color = if (url.isNotEmpty()) Color.Red else Color.Unspecified
-            )
+fun MarkingScreen(serviceSettings: ServiceSettings, qrUrl: String) {
+    // Результаты приходят SSE-потоком по мере готовности каждого студента.
+    val results = remember { mutableStateListOf<MarkEvent>() }
+    var summary by remember { mutableStateOf<MarkSummary?>(null) }
+    var errorText by remember { mutableStateOf<String?>(null) }
+    var running by remember { mutableStateOf(false) }
+    // URL, для которого отметка уже запускалась: не рестартовать при рекомпозиции.
+    var startedFor by remember { mutableStateOf<String?>(null) }
+
+    fun startMarking() {
+        if (running || qrUrl.isEmpty()) return
+        if (!serviceSettings.isConfigured()) {
+            errorText = "Укажите адрес и токен сервиса во вкладке «Аккаунты»"
+            return
         }
-        return
+        results.clear()
+        summary = null
+        errorText = null
+        running = true
+        ServiceClient(serviceSettings).mark(
+            qrUrl = qrUrl,
+            studentIds = null, // null = все студенты, выбранные галочками
+            onEvent = { results.add(it) },
+            onSummary = {
+                summary = it
+                running = false
+            },
+            onError = {
+                errorText = it
+                running = false
+            }
+        )
     }
 
-    var currentAccountIndex by remember { mutableIntStateOf(0) }
-    var statusText by remember { mutableStateOf("Инициализация...") }
-
-    val context = LocalContext.current
-    val webView = remember {
-        WebView(context).apply {
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.userAgentString = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    LaunchedEffect(qrUrl) {
+        if (qrUrl.isNotEmpty() && startedFor != qrUrl) {
+            startedFor = qrUrl
+            startMarking()
         }
     }
 
-    val account = accounts.getOrNull(currentAccountIndex)
-
-    if (account == null) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Все выбранные аккаунты отмечены!", style = MaterialTheme.typography.headlineMedium, color = Color.Green)
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        if (qrUrl.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    "Отсканируйте QR-код",
+                    style = MaterialTheme.typography.bodyLarge
+                )
+            }
+            return
         }
-        return
-    }
 
-    LaunchedEffect(currentAccountIndex) {
-        if (account != null) {
-            statusText = "Вход как ${account.first}..."
+        Text(
+            text = "QR-ссылка:",
+            style = MaterialTheme.typography.titleSmall
+        )
+        Text(
+            text = qrUrl,
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
 
-            android.webkit.CookieManager.getInstance().removeAllCookies(null)
-            android.webkit.CookieManager.getInstance().flush()
+        Spacer(modifier = Modifier.height(12.dp))
 
-            webView.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, currentUrl: String?) {
-                    super.onPageFinished(view, currentUrl)
-                    if (view == null || currentUrl == null) return
+        when {
+            running -> {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text("Отмечаю… готово: ${results.size}", style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+            summary != null -> {
+                val s = summary!!
+                Text(
+                    text = "Готово: ${s.success} отмечено, ${s.already} уже были отмечены, ${s.error} ошибок",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = if (s.error == 0) Color.Green else MaterialTheme.colorScheme.error
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(onClick = { startMarking() }) { Text("Отметить снова") }
+            }
+            errorText != null -> {
+                Text(errorText!!, color = Color.Red)
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(onClick = { startMarking() }) { Text("Повторить") }
+            }
+        }
 
-                    if (currentUrl.contains("login/index.php")) {
-                        val js = """
-                            javascript:(function() {
-                                var user = document.getElementById('username');
-                                var pass = document.getElementById('password');
-                                if (user && pass) {
-                                    user.value = '${account.first}';
-                                    pass.value = '${account.second}';
-                                    document.getElementById('loginbtn').click();
+        if (results.isNotEmpty()) {
+            HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+            LazyColumn {
+                items(results) { event ->
+                    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                        Row(
+                            modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(event.login, style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                text = event.message,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = when (event.status) {
+                                    "success" -> Color.Green
+                                    "already" -> MaterialTheme.colorScheme.primary
+                                    else -> Color.Red
                                 }
-                            })()
-                        """.trimIndent()
-                        view.evaluateJavascript(js, null)
-                    }
-                    else if (currentUrl.contains("attendance.php")) {
-                        statusText = "Анализ страницы..."
-                        val qrPass = parseQrPassword(url)
-
-                        val js = """
-                            javascript:(function() {
-                                var bodyText = document.body.innerText;
-                                
-                                if (bodyText.includes('уже была отмечена') || bodyText.includes('already been marked')) {
-                                    window.location.href = 'https://lms.uni-dubna.ru/mod/attendance/view.php?id=122864&success=true';
-                                    return;
-                                }
-
-                                var radios = document.querySelectorAll('input[type="radio"][name="status"]');
-                                var clicked = false;
-                                var presentWords = ['present', 'присутств', 'был', 'была', 'были', 'явился', 'явилась', 'уважительн'];
-                                
-                                for (var i = 0; i < radios.length; i++) {
-                                    var parentText = radios[i].parentElement.innerText.toLowerCase();
-                                    var fullText = (radios[i].nextSibling ? radios[i].nextSibling.textContent : "") + parentText;
-                                    
-                                    for (var j = 0; j < presentWords.length; j++) {
-                                        if (fullText.includes(presentWords[j])) {
-                                            radios[i].checked = true;
-                                            clicked = true;
-                                            break;
-                                        }
-                                    }
-                                    if (clicked) break;
-                                }
-                                
-                                if (!clicked && radios.length > 0) {
-                                    radios[0].checked = true;
-                                }
-
-                                var qrInput = document.querySelector('input[name="studentpassword"]');
-                                if (qrInput && '$qrPass' !== "") {
-                                    qrInput.value = '$qrPass';
-                                }
-                                
-                                var saveBtn = document.querySelector('button[type="submit"], input[type="submit"]');
-                                if (saveBtn) saveBtn.click();
-                            })()
-                        """.trimIndent()
-                        view.evaluateJavascript(js, null)
-                    }
-                    else if (currentUrl.contains("success=true") || currentUrl.contains("attendance/view.php")) {
-                        statusText = "Успех! Переход..."
-                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                            currentAccountIndex++
-                        }, 1500)
-                    }
-                    else if (!currentUrl.contains("attendance")) {
-                        statusText = "Редирект..."
-                        view.loadUrl(url)
+                            )
+                        }
                     }
                 }
             }
-            webView.loadUrl(url)
+        }
+    }
+}
+
+// ================== АККАУНТЫ (СТУДЕНТЫ) ==================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AccountsScreen(serviceSettings: ServiceSettings) {
+    var students by remember { mutableStateOf<List<Student>?>(null) }
+    var loadError by remember { mutableStateOf<String?>(null) }
+    var showSettings by remember { mutableStateOf(!serviceSettings.isConfigured()) }
+    // Диалог: null = закрыт; Student = редактирование; "new" = добавление нового.
+    var editTarget by remember { mutableStateOf<Any?>(null) }
+    var busy by remember { mutableStateOf(false) }
+
+    fun reload() {
+        ServiceClient(serviceSettings).getStudents(
+            onSuccess = {
+                students = it
+                loadError = null
+            },
+            onError = {
+                loadError = it
+                students = null
+            }
+        )
+    }
+
+    LaunchedEffect(Unit) {
+        if (serviceSettings.isConfigured()) reload()
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        // --- Настройки сервиса: адрес + токен (скрыты, если уже сконфигурировано) ---
+        if (showSettings) {
+            SettingsCard(
+                settings = serviceSettings,
+                onSaved = {
+                    showSettings = false
+                    reload()
+                }
+            )
+            HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Студенты на сервисе (${students?.size ?: "…"})", style = MaterialTheme.typography.titleMedium)
+                Row {
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Настройки сервиса")
+                    }
+                    IconButton(onClick = { editTarget = "new" }) {
+                        Icon(Icons.Default.Edit, contentDescription = "Добавить студента")
+                    }
+                }
+            }
+        }
+
+        when {
+            !serviceSettings.isConfigured() && !showSettings -> {
+                Text("Сервис не настроен", color = MaterialTheme.colorScheme.error)
+            }
+            loadError != null -> {
+                Text(loadError!!, color = Color.Red)
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(onClick = { reload() }) { Text("Повторить") }
+            }
+            students == null && serviceSettings.isConfigured() && !showSettings -> {
+                CircularProgressIndicator()
+            }
+            students != null -> {
+                LazyColumn {
+                    items(students!!) { student ->
+                        Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            Row(
+                                modifier = Modifier.padding(start = 16.dp).fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "${student.lastName} ${student.firstName}, ${student.studyGroup}",
+                                        style = MaterialTheme.typography.bodyLarge
+                                    )
+                                    Text(
+                                        student.lmsLogin,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Checkbox(
+                                    checked = student.isSelected,
+                                    onCheckedChange = { checked ->
+                                        busy = true
+                                        ServiceClient(serviceSettings).updateStudent(
+                                            id = student.id, isSelected = checked,
+                                            onDone = { error ->
+                                                busy = false
+                                                if (error != null) loadError = error else reload()
+                                            }
+                                        )
+                                    }
+                                )
+                                IconButton(
+                                    enabled = !busy,
+                                    onClick = {
+                                        busy = true
+                                        ServiceClient(serviceSettings).deleteStudent(
+                                            id = student.id,
+                                            onDone = { error ->
+                                                busy = false
+                                                if (error != null) loadError = error else reload()
+                                            }
+                                        )
+                                    }
+                                ) {
+                                    Icon(Icons.Default.Delete, contentDescription = "Удалить", tint = Color.Red)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        Text(
-            text = "Аккаунт ${currentAccountIndex + 1} из ${accounts.size}: ${account.first}\nСтатус: $statusText",
-            modifier = Modifier.padding(16.dp),
-            color = MaterialTheme.colorScheme.primary
-        )
-
-        AndroidView(
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            factory = { webView }
+    if (editTarget != null) {
+        StudentDialog(
+            initial = editTarget as? Student,
+            onDismiss = { editTarget = null },
+            onSave = { firstName, lastName, group, login, password ->
+                busy = true
+                val client = ServiceClient(serviceSettings)
+                val target = editTarget
+                val onSaved: (String?) -> Unit = { error ->
+                    busy = false
+                    editTarget = null
+                    if (error != null) loadError = error
+                    reload()
+                }
+                if (target is Student) {
+                    client.updateStudent(
+                        id = target.id,
+                        firstName = firstName, lastName = lastName, studyGroup = group, lmsLogin = login,
+                        // Пустое поле пароля = пароль не менять
+                        lmsPassword = password.ifBlank { null },
+                        onDone = onSaved
+                    )
+                } else {
+                    client.createStudent(firstName, lastName, group, login, password, onDone = onSaved)
+                }
+            }
         )
     }
 }
 
-fun parseQrPassword(url: String): String {
-    return try {
-        val uri = android.net.Uri.parse(url)
-        uri.getQueryParameter("qrpass") ?: ""
-    } catch (e: Exception) {
-        ""
-    }
-}
-
-// ================== АККАУНТЫ ==================
-@OptIn(ExperimentalMaterial3Api::class)
+// Карточка настроек: адрес сервиса + bearer-токен.
 @Composable
-fun AccountsScreen(accountManager: AccountManager) {
-    // ИЗМЕНЕНИЕ: Теперь используем UserAccount вместо Pair
-    var accounts by remember { mutableStateOf(accountManager.getAccounts()) }
-    var login by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
+fun SettingsCard(settings: ServiceSettings, onSaved: () -> Unit) {
+    var url by remember { mutableStateOf(settings.getUrl()) }
+    var token by remember { mutableStateOf(settings.getToken()) }
+    var errorText by remember { mutableStateOf<String?>(null) }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Добавить аккаунт", style = MaterialTheme.typography.titleMedium)
-
+    Column {
+        Text("Настройки сервиса", style = MaterialTheme.typography.titleMedium)
+        Spacer(modifier = Modifier.height(4.dp))
         OutlinedTextField(
-            value = login, onValueChange = { login = it },
-            label = { Text("Логин") }, modifier = Modifier.fillMaxWidth()
+            value = url,
+            onValueChange = { url = it },
+            label = { Text("Адрес сервиса (например, http://192.168.1.10:8080)") },
+            modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+            singleLine = true
         )
         OutlinedTextField(
-            value = password, onValueChange = { password = it },
-            label = { Text("Пароль") },
+            value = token,
+            onValueChange = { token = it },
+            label = { Text("Токен доступа") },
+            modifier = Modifier.fillMaxWidth(),
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            modifier = Modifier.fillMaxWidth()
+            singleLine = true
         )
-
+        if (errorText != null) {
+            Text(errorText!!, color = Color.Red, modifier = Modifier.padding(top = 4.dp))
+        }
         Button(
             onClick = {
-                if (login.isNotBlank() && password.isNotBlank()) {
-                    accountManager.addAccount(login, password)
-                    accounts = accountManager.getAccounts()
-                    login = ""
-                    password = ""
+                if (url.isBlank() || token.isBlank()) {
+                    errorText = "Введите адрес и токен"
+                } else {
+                    settings.save(url, token)
+                    onSaved()
                 }
             },
             modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
-        ) { Text("Добавить") }
+        ) { Text("Сохранить") }
+    }
+}
 
-        HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+// Диалог добавления/редактирования студента. При редактировании пустой пароль
+// означает «пароль не менять» — сервис не возвращает пароли, показать их нельзя.
+@Composable
+fun StudentDialog(
+    initial: Student?,
+    onDismiss: () -> Unit,
+    onSave: (firstName: String, lastName: String, group: String, login: String, password: String) -> Unit
+) {
+    var firstName by remember { mutableStateOf(initial?.firstName ?: "") }
+    var lastName by remember { mutableStateOf(initial?.lastName ?: "") }
+    var group by remember { mutableStateOf(initial?.studyGroup ?: "") }
+    var login by remember { mutableStateOf(initial?.lmsLogin ?: "") }
+    var password by remember { mutableStateOf("") }
+    var errorText by remember { mutableStateOf<String?>(null) }
 
-        Text("Список аккаунтов (${accounts.size})", style = MaterialTheme.typography.titleMedium)
-
-        LazyColumn {
-            items(accounts) { account ->
-                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                    Row(
-                        modifier = Modifier.padding(16.dp).fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            // ИЗМЕНЕНИЕ: Добавили CheckBox
-                            Checkbox(
-                                checked = account.isSelected,
-                                onCheckedChange = {
-                                    accountManager.toggleAccountSelection(account.login)
-                                    accounts = accountManager.getAccounts() // Обновляем список
-                                }
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(text = account.login, style = MaterialTheme.typography.bodyLarge)
-                        }
-
-                        IconButton(onClick = {
-                            accountManager.removeAccount(account.login)
-                            accounts = accountManager.getAccounts()
-                        }) {
-                            Icon(Icons.Default.Delete, contentDescription = "Удалить", tint = Color.Red)
-                        }
-                    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (initial == null) "Добавить студента" else "Редактировать студента") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = lastName, onValueChange = { lastName = it },
+                    label = { Text("Фамилия") }, singleLine = true
+                )
+                OutlinedTextField(
+                    value = firstName, onValueChange = { firstName = it },
+                    label = { Text("Имя") }, singleLine = true
+                )
+                OutlinedTextField(
+                    value = group, onValueChange = { group = it },
+                    label = { Text("Группа") }, singleLine = true
+                )
+                OutlinedTextField(
+                    value = login, onValueChange = { login = it },
+                    label = { Text("Логин LMS") }, singleLine = true
+                )
+                OutlinedTextField(
+                    value = password, onValueChange = { password = it },
+                    label = { Text(if (initial == null) "Пароль LMS" else "Пароль LMS (пусто — не менять)") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    singleLine = true
+                )
+                if (errorText != null) {
+                    Text(errorText!!, color = Color.Red, modifier = Modifier.padding(top = 4.dp))
                 }
             }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (lastName.isBlank() || firstName.isBlank() || group.isBlank() ||
+                    login.isBlank() || (initial == null && password.isBlank())
+                ) {
+                    errorText = "Заполните все поля" + if (initial != null) " (пароль можно не менять)" else ""
+                } else {
+                    onSave(firstName.trim(), lastName.trim(), group.trim(), login.trim(), password)
+                }
+            }) { Text("Сохранить") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Отмена") }
         }
-    }
+    )
 }
