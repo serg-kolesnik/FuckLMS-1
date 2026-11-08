@@ -21,6 +21,23 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
 
+    # PostgreSQL для интеграционных тестов Store (build tag `integration`):
+    # без него store.go не попадает в покрытие и гейт 90% не проходит.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fucklms_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       # 1. Клонируем репозиторий
       - name: Checkout service code
@@ -46,9 +63,11 @@ jobs:
           version: v2.15
           working-directory: './server'
 
-      # 4. Запуск тестов
+      # 4. Запуск тестов (юнит + интеграционные против сервиса PostgreSQL)
       - name: Run tests with coverage
-        run: go test -v -coverprofile=coverage.out ./...
+        env:
+          FLMS_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/fucklms_test?sslmode=disable
+        run: go test -v -coverprofile=coverage.out -tags=integration ./...
 
       # 5. Проверяем, что общее покрытие кода >= 90%
       - name: Check code coverage threshold

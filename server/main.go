@@ -16,7 +16,34 @@ import (
 // app — общий контекст обработчиков.
 type app struct {
 	cfg   Config
-	store *Store
+	store studentStore
+}
+
+// studentStore — операции хранилища, которые нужны HTTP-обработчикам.
+// Основная реализация — *Store (PostgreSQL); тесты подменяют её фейком.
+type studentStore interface {
+	Ping(ctx context.Context) error
+	ListStudents(ctx context.Context) ([]Student, error)
+	CreateStudent(ctx context.Context, in StudentCreate) (Student, error)
+	UpdateStudent(ctx context.Context, id int64, in StudentUpdate) (Student, error)
+	DeleteStudent(ctx context.Context, id int64) (bool, error)
+	StudentsByIDs(ctx context.Context, ids []int64) ([]studentRecord, error)
+	SelectedStudents(ctx context.Context) ([]studentRecord, error)
+}
+
+// Страховка: *Store обязан реализовывать интерфейс хранилища.
+var _ studentStore = (*Store)(nil)
+
+// routes собирает HTTP-роутер: /health без авторизации, остальные ручки за токеном.
+func (a *app) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", a.handleHealth)
+	mux.HandleFunc("GET /api/students", a.auth(a.handleListStudents))
+	mux.HandleFunc("POST /api/students", a.auth(a.handleCreateStudent))
+	mux.HandleFunc("PUT /api/students/{id}", a.auth(a.handleUpdateStudent))
+	mux.HandleFunc("DELETE /api/students/{id}", a.auth(a.handleDeleteStudent))
+	mux.HandleFunc("POST /api/mark", a.auth(a.handleMark))
+	return mux
 }
 
 func main() {
@@ -33,17 +60,9 @@ func main() {
 
 	a := &app{cfg: cfg, store: store}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", a.handleHealth)
-	mux.HandleFunc("GET /api/students", a.auth(a.handleListStudents))
-	mux.HandleFunc("POST /api/students", a.auth(a.handleCreateStudent))
-	mux.HandleFunc("PUT /api/students/{id}", a.auth(a.handleUpdateStudent))
-	mux.HandleFunc("DELETE /api/students/{id}", a.auth(a.handleDeleteStudent))
-	mux.HandleFunc("POST /api/mark", a.auth(a.handleMark))
-
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           a.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

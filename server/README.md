@@ -53,6 +53,25 @@ docker compose up -d
 psql "$DATABASE_URL" -f migrations/0001_init.sql
 ```
 
+## Тесты
+
+Юнит-тесты не требуют ни БД, ни выхода в сеть: Moodle подменяется
+`httptest`-заглушкой, хранилище — фейком в памяти.
+
+```bash
+go test ./...
+```
+
+Интеграционные тесты (build tag `integration`) проверяют `Store` против
+настоящего PostgreSQL. Схема пересоздаётся из `migrations/0001_init.sql`,
+поэтому база обязана быть **одноразовой** — никаких продакшен-данных:
+
+```bash
+FLMS_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/fucklms_test \
+  go test -tags=integration -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out   # общее покрытие; гейт CI — 90%
+```
+
 ## Быстрая проверка
 
 ```bash
@@ -81,6 +100,7 @@ curl -N -X POST http://localhost:8080/api/mark \
 | `api.go` | HTTP-обработчики: health, CRUD, bearer-авторизация |
 | `mark.go` | `POST /api/mark`: разбор QR-ссылки, пул воркеров, SSE-стрим |
 | `lms.go` | клиент Moodle: логин (`logintoken`), отметка (`sesskey`, выбор статуса по подписи) |
+| `*_test.go` | юнит-тесты + интеграционные (`-tags=integration`), см. раздел «Тесты» |
 | `migrations/0001_init.sql` | таблица `students` |
 
 ## Безопасность
