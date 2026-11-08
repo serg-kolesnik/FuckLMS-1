@@ -1,353 +1,440 @@
 openapi: 3.0.3
 info:
-  title: FuckLMS Moodle Integration
+  title: FuckLMS Attendance Service API
   description: |
-    This document describes the HTTP interaction with Moodle LMS used by the Android client in the
-    `slipynil/FuckLMS` repository. The app does not expose its own backend REST API; instead,
-    it authenticates against the Moodle LMS at `https://lms.uni-dubna.ru` and submits HTML form
-    data to mark attendance.
+    HTTP contract of the FuckLMS attendance service — a standalone Go service (the `server/`
+    directory of this repository) that performs Moodle LMS login and attendance marking on
+    behalf of stored students.
 
-    Two client mechanisms exist in the codebase, both targeting the endpoints below:
+    Architecture (see `docs/adr/0001-go-attendance-service.md`):
 
-    - **Primary (active in the UI):** an embedded `WebView` (`BrowserScreen` in `MainActivity.kt`)
-      that loads these pages and automates them via injected JavaScript — filling the login form,
-      selecting the "present" status radio, and clicking the save button.
-    - **Auxiliary (not wired to the UI):** `MoodleClient.kt`, a direct OkHttp client that parses
-      the HTML of these pages with regexes and submits the same forms programmatically.
-
-    Moodle is a form- and cookie-based web application, so this contract describes HTML pages and
-    `application/x-www-form-urlencoded` submissions rather than a JSON REST API.
-  version: 1.0.0
+    - The Android app talks only to this service. It no longer stores student credentials and
+      no longer automates Moodle itself: the WebView flow and the on-device account storage
+      are removed.
+    - The service keeps students in its PostgreSQL database (table `students`) and performs
+      the actual Moodle interaction — HTML form login and attendance submission, in parallel
+      per student. The Moodle side of the interaction (HTML pages and
+      `application/x-www-form-urlencoded` submissions at `https://lms.uni-dubna.ru`) is an
+      implementation detail of the service and is described in `docs/network-api.md`.
+    - Attendance marking streams per-student results as Server-Sent Events (`text/event-stream`).
+    - Passwords are accepted on create/update and are **never** returned in any response.
+    - All endpoints except `GET /health` require a static bearer token.
+  version: 2.0.0
   contact:
     name: FuckLMS project
     url: https://github.com/slipynil/FuckLMS
 servers:
-  - url: https://lms.uni-dubna.ru
-    description: Moodle LMS server used by the app
+  - url: http://localhost:8080
+    description: Local service instance; the real URL is configured in the app settings
 security:
-  - cookieAuth: []
+  - bearerAuth: []
+tags:
+  - name: Health
+    description: Liveness probes
+  - name: Students
+    description: CRUD over stored student accounts
+  - name: Attendance
+    description: Attendance marking with streamed results
 paths:
-  /login/index.php:
+  /health:
     get:
       tags:
-        - Authentication
-      summary: Retrieve Moodle login page and logintoken
-      description: |
-        The app requests the login page first to extract the hidden `logintoken` field required
-        by Moodle. This request is done with a browser-like User-Agent and does not require
-        authentication.
-      parameters:
-        - in: header
-          name: User-Agent
-          required: true
-          schema:
-            type: string
-            example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+        - Health
+      summary: Liveness probe
+      description: Checks that the HTTP server is up and the PostgreSQL connection responds.
+      security: []
       responses:
         '200':
-          description: Login page HTML containing the `logintoken` input field
+          description: Service is healthy
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
-              example: |
-                <html>...
-                <input type="hidden" name="logintoken" value="abc123xyz">
-                ...
-        '302':
-          description: Redirect if the login page redirects to a different Moodle route
-          headers:
-            Location:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: Service is up but the database is unreachable
+          content:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/HealthStatus'
+  /api/students:
+    get:
+      tags:
+        - Students
+      summary: List students
+      description: |
+        Returns all stored students ordered by id. Passwords are never included in responses.
+      responses:
+        '200':
+          description: List of students
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Student'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
     post:
       tags:
-        - Authentication
-      summary: Submit credentials and authenticate the user
+        - Students
+      summary: Create a student
       description: |
-        After obtaining the `logintoken`, the app sends a standard Moodle form submission with
-        username and password. Cookies are preserved by the app to maintain the authenticated session.
-      parameters:
-        - in: header
-          name: User-Agent
-          required: true
-          schema:
-            type: string
-            example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
-        - in: header
-          name: Referer
-          required: true
-          schema:
-            type: string
-            example: https://lms.uni-dubna.ru/login/index.php
-        - in: header
-          name: Origin
-          required: true
-          schema:
-            type: string
-            example: https://lms.uni-dubna.ru
+        Creates a student record. `lmsLogin` must be unique — duplicates are rejected with `409`.
+        The password is stored as provided; it is the actual LMS password used later by
+        `POST /api/mark`.
       requestBody:
         required: true
         content:
-          application/x-www-form-urlencoded:
+          application/json:
             schema:
-              $ref: '#/components/schemas/LoginFormRequest'
+              $ref: '#/components/schemas/StudentCreate'
       responses:
-        '200':
-          description: Authentication result page. Success is inferred when the response does not contain login errors or logintoken fields.
+        '201':
+          description: Student created
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
-        '302':
-          description: Redirect after successful login
-          headers:
-            Set-Cookie:
-              schema:
-                type: string
-              description: Moodle session cookie(s) used for subsequent authenticated requests
-            Location:
-              schema:
-                type: string
-        '403':
-          description: Access denied or invalid credentials
-  /mod/attendance/attendance.php:
-    get:
-      tags:
-        - Attendance
-      summary: Open the attendance page and obtain the sesskey
-      description: |
-        The client builds the attendance URL with `sessid` and optional `qrpass` from the QR code,
-        then requests the page. The direct HTTP client (`MoodleClient`) parses the `sesskey` value
-        from the HTML; the embedded WebView instead injects JavaScript that checks whether the
-        attendance has already been marked (`уже была отмечена` / `already been marked`) and,
-        if not, selects the "present" radio button, fills `studentpassword` from `qrpass`,
-        and submits the form from the page itself.
-      parameters:
-        - in: query
-          name: sessid
-          required: true
-          schema:
-            type: string
-            example: '123456'
-        - in: query
-          name: qrpass
-          required: false
-          schema:
-            type: string
-            nullable: true
-            example: 'abc123'
-        - in: header
-          name: User-Agent
-          required: true
-          schema:
-            type: string
-            example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
-      responses:
-        '200':
-          description: Attendance page HTML. The app searches the response for `sesskey`.
+                $ref: '#/components/schemas/Student'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A student with the same `lmsLogin` already exists
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
-              example: |
-                <html>...
-                <a href="attendance.php?sessid=123456&sesskey=ABCD1234">...</a>
-                ...
-        '302':
-          description: Redirect to login page if the session is expired or invalid
-    post:
+                $ref: '#/components/schemas/Error'
+  /api/students/{id}:
+    put:
       tags:
-        - Attendance
-      summary: Submit an attendance mark
+        - Students
+      summary: Update a student
       description: |
-        The app posts the attendance form with the parsed `sesskey` and marks the student as present.
-        If a QR password is present, it is also included as `studentpassword` and `qrpass`.
+        Updates the given fields. All fields are optional; an omitted `lmsPassword` means
+        the password is left unchanged.
       parameters:
-        - in: query
-          name: sessid
-          required: true
-          schema:
-            type: string
-            example: '123456'
-        - in: query
-          name: mark
-          required: true
-          schema:
-            type: string
-            enum: ['1']
-            example: '1'
-        - in: header
-          name: User-Agent
-          required: true
-          schema:
-            type: string
-            example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
-        - in: header
-          name: Referer
-          required: true
-          schema:
-            type: string
-            example: https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid=123456
-        - in: header
-          name: Origin
-          required: true
-          schema:
-            type: string
-            example: https://lms.uni-dubna.ru
+        - $ref: '#/components/parameters/StudentId'
       requestBody:
         required: true
         content:
-          application/x-www-form-urlencoded:
+          application/json:
             schema:
-              $ref: '#/components/schemas/AttendanceMarkRequest'
+              $ref: '#/components/schemas/StudentUpdate'
       responses:
         '200':
-          description: Attendance response page. The direct HTTP client interprets success by looking for saved/success indicators in HTML.
+          description: Updated student
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
-              example: |
-                <html>...Saved...</html>
-        '302':
-          description: Redirect after saving the mark
-  /mod/attendance/view.php:
-    get:
+                $ref: '#/components/schemas/Student'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - Students
+      summary: Delete a student
+      parameters:
+        - $ref: '#/components/parameters/StudentId'
+      responses:
+        '204':
+          description: Student deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/mark:
+    post:
       tags:
         - Attendance
-      summary: Attendance module view page (success confirmation)
+      summary: Mark attendance for students (SSE stream)
       description: |
-        General attendance module page. The embedded WebView uses it as the success landmark:
-        after a successful save (or when the page text indicates the attendance has already been
-        marked), the injected JavaScript navigates to `view.php?id=122864&success=true`, which
-        makes `BrowserScreen` show the success status and proceed to the next selected account.
-      parameters:
-        - in: query
-          name: id
-          required: false
-          schema:
-            type: string
-            example: '122864'
-          description: Attendance module instance id (hardcoded in the current WebView flow)
-        - in: query
-          name: success
-          required: false
-          schema:
-            type: string
-            enum: ['true']
-            example: 'true'
+        Runs the Moodle login + attendance flow for the requested students in parallel
+        (bounded worker pool, default concurrency 5, configurable via environment) and streams
+        one `result` event per student as soon as it is ready, followed by a final `done` event.
+
+        Stream format (`text/event-stream`):
+
+        ```
+        event: result
+        data: {"login":"ivanov","status":"success","message":"Отмечено"}
+
+        event: result
+        data: {"login":"petrov","status":"already","message":"Посещаемость уже была отмечена"}
+
+        event: done
+        data: {"total":2,"success":1,"already":1,"error":0}
+        ```
+
+        - `result` events arrive in arbitrary order (students are processed concurrently).
+        - `status`: `success` — the mark was saved; `already` — attendance had been marked
+          before (treated as success); `error` — this student failed, the stream continues.
+        - Comment lines `: ping` are emitted every ~15 seconds as keep-alive.
+
+        Rules:
+
+        - `qrUrl` must point to `lms.uni-dubna.ru` and contain a `sessid` query parameter;
+          the optional QR password is read from `qrpass`, `password`, or `studentpassword`
+          (in that priority order).
+        - `studentIds` omitted or empty → all students with `isSelected = true` are marked.
+        - A client disconnect does not cancel in-flight marks; there is no stream resume in v1.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarkRequest'
       responses:
         '200':
-          description: Attendance module overview page HTML
+          description: SSE stream with per-student results and a final summary
           content:
-            text/html:
+            text/event-stream:
               schema:
                 type: string
+                description: |-
+                  Concatenated SSE events:
+                  `event: result` + `data: <MarkResultEvent>` (zero or more),
+                  then `event: done` + `data: <MarkSummary>`.
+        '400':
+          description: |
+            Invalid request: missing/foreign `qrUrl`, missing `sessid`, or no students match
+            the selection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 components:
   securitySchemes:
-    cookieAuth:
-      type: apiKey
-      in: cookie
-      name: MoodleSession
-      description: Moodle session cookie maintained by the app after successful login.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Static token configured on the service via environment
+  parameters:
+    StudentId:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      description: Student identifier
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Student with the given id does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ValidationError:
+      description: Request body is invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
   schemas:
-    LoginFormRequest:
+    Student:
+      type: object
+      description: Stored student. Never contains a password.
+      required:
+        - id
+        - firstName
+        - lastName
+        - studyGroup
+        - lmsLogin
+        - isSelected
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        firstName:
+          type: string
+          maxLength: 100
+          example: Иван
+        lastName:
+          type: string
+          maxLength: 100
+          example: Иванов
+        studyGroup:
+          type: string
+          maxLength: 50
+          example: 101-А
+        lmsLogin:
+          type: string
+          maxLength: 100
+          example: ivanov
+        isSelected:
+          type: boolean
+          description: Whether this student is included when no explicit id list is given
+          example: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    StudentCreate:
       type: object
       additionalProperties: false
       required:
-        - username
-        - password
-        - rememberusername
-        - logintoken
+        - firstName
+        - lastName
+        - studyGroup
+        - lmsLogin
+        - lmsPassword
       properties:
-        username:
+        firstName:
           type: string
-          description: Student or user login used in Moodle
-          example: ivanov@student
-        password:
+          maxLength: 100
+          example: Иван
+        lastName:
+          type: string
+          maxLength: 100
+          example: Иванов
+        studyGroup:
+          type: string
+          maxLength: 50
+          example: 101-А
+        lmsLogin:
+          type: string
+          maxLength: 100
+          description: LMS (Moodle) login; unique across students
+          example: ivanov
+        lmsPassword:
           type: string
           format: password
-          description: Moodle account password
+          maxLength: 255
+          description: LMS (Moodle) password; stored as provided, never returned
           example: strongPassword123
-        rememberusername:
+    StudentUpdate:
+      type: object
+      additionalProperties: false
+      description: All fields optional; omitted `lmsPassword` keeps the current password.
+      properties:
+        firstName:
           type: string
-          enum: ['0']
-          description: Moodle flag controlling whether username is remembered
-          example: '0'
-        logintoken:
+          maxLength: 100
+        lastName:
           type: string
-          description: Hidden token retrieved from the login page
-          example: abc123xyz
-    AttendanceMarkRequest:
+          maxLength: 100
+        studyGroup:
+          type: string
+          maxLength: 50
+        lmsLogin:
+          type: string
+          maxLength: 100
+        lmsPassword:
+          type: string
+          format: password
+          maxLength: 255
+        isSelected:
+          type: boolean
+    MarkRequest:
       type: object
       additionalProperties: false
       required:
-        - sessid
-        - sesskey
-        - status
-        - submitbutton
+        - qrUrl
       properties:
-        sessid:
+        qrUrl:
           type: string
-          description: Unique attendance session identifier from the QR or LMS URL
-          example: '123456'
-        sesskey:
-          type: string
-          description: Moodle CSRF-like token extracted from the attendance page
-          example: ABCD1234
-        status:
-          type: string
-          enum: ['1']
+          format: uri
           description: |
-            Attendance status code. In the direct HTTP client it is always fixed to "present" (1).
-            In the WebView flow the "present" option is located by matching its label text
-            (present / присутств / был / явился and similar words), falling back to the first radio.
-          example: '1'
-        submitbutton:
-          type: string
-          enum: ['Save']
-          description: Moodle submit button label
-          example: Save
-        studentpassword:
-          type: string
-          nullable: true
-          description: Optional QR-provided password, if the attendance link includes it
-          example: qrPassword123
-        qrpass:
-          type: string
-          nullable: true
-          description: Optional QR password duplicate sent by the Moodle form
-          example: qrPassword123
-    QRData:
+            Raw URL from the scanned QR code. Host must be `lms.uni-dubna.ru`; must contain
+            a `sessid` query parameter. Optional QR password is taken from `qrpass`,
+            `password`, or `studentpassword`.
+          example: https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid=123456&qrpass=abc123
+        studentIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: Students to mark. Omitted or empty → all students with `isSelected = true`.
+          example: [1, 5, 12]
+    MarkResultEvent:
       type: object
-      required:
-        - sessionId
-      properties:
-        sessionId:
-          type: string
-          description: Attendance session identifier taken from the QR URL
-          example: '123456'
-        qrPassword:
-          type: string
-          nullable: true
-          description: Optional password extracted from `qrpass`, `password`, or `studentpassword`
-          example: qrPassword123
-    UserAccount:
-      type: object
+      description: Payload of one SSE `result` event.
       required:
         - login
-        - password
+        - status
+        - message
       properties:
         login:
           type: string
-          example: ivanov@student
-        password:
+          description: LMS login of the student this result belongs to
+          example: ivanov
+        status:
           type: string
-          format: password
-          example: secret
-        isSelected:
-          type: boolean
-          description: Whether the account is currently selected as the active profile
-          default: true
-          example: true
+          enum:
+            - success
+            - already
+            - error
+          description: |
+            `success` — mark saved; `already` — attendance had been marked before
+            (treated as success); `error` — this student failed, the stream continues.
+          example: success
+        message:
+          type: string
+          description: Human-readable detail (Russian, as shown in the app)
+          example: Отмечено
+    MarkSummary:
+      type: object
+      description: Payload of the final SSE `done` event.
+      required:
+        - total
+        - success
+        - already
+        - error
+      properties:
+        total:
+          type: integer
+          example: 3
+        success:
+          type: integer
+          example: 1
+        already:
+          type: integer
+          example: 1
+        error:
+          type: integer
+          example: 1
+    HealthStatus:
+      type: object
+      required:
+        - status
+        - database
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+            - degraded
+          example: ok
+        database:
+          type: string
+          enum:
+            - up
+            - down
+          example: up
+    Error:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          example: qrUrl host is not allowed
