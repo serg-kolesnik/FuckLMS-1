@@ -1,0 +1,41 @@
+# Стек сервиса посещаемости FuckLMS (ADR 0001): PostgreSQL + Go-сервис.
+# Секреты задаются в server/.env рядом с этим файлом (шаблон — .env.example).
+# Запуск: docker compose up -d
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fucklms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в server/.env}
+      POSTGRES_DB: fucklms
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Схема применяется автоматически ТОЛЬКО при первой инициализации тома
+      # pgdata (docker-entrypoint-initdb.d); дальнейшие миграции — вручную,
+      # см. раздел «Миграция» в README.
+      - ./migrations/0001_init.sql:/docker-entrypoint-initdb.d/0001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fucklms -d fucklms"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    # Образ из CI (server-ci.yml). Если его нет локально в реестре —
+    # docker compose соберёт его из Dockerfile (build ниже).
+    image: ghcr.io/slipynil/fucklms-server:latest
+    build: .
+    restart: unless-stopped
+    environment:
+      TOKEN: ${TOKEN:?задайте TOKEN в server/.env}
+      DATABASE_URL: postgres://fucklms:${POSTGRES_PASSWORD}@db:5432/fucklms
+      # PORT, MARK_CONCURRENCY, LMS_BASE_URL — опциональны, значения по умолчанию — в README.
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

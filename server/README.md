@@ -15,6 +15,26 @@ go vet ./...          # статический анализ
 go build -o fucklms-server .
 ```
 
+## Запуск через Docker Compose
+
+Стек целиком — PostgreSQL + сервис — описан в [`docker-compose.yml`](docker-compose.yml):
+
+```bash
+cp .env.example .env   # заполните TOKEN и POSTGRES_PASSWORD
+docker compose up -d
+```
+
+- сервис доступен на `http://<хост>:8080`; этот адрес и `TOKEN` вводятся в настройках
+  сервиса в Android-приложении;
+- схема БД применяется **только при первой инициализации** тома `pgdata`
+  (через `docker-entrypoint-initdb.d`); последующие миграции — вручную, как в
+  разделе «Миграция»;
+- по умолчанию используется образ `ghcr.io/slipynil/fucklms-server:latest`, который
+  публикует CI; если образа ещё нет — `docker compose up -d --build` соберёт его
+  локально из `Dockerfile`;
+- пакет в GHCR по умолчанию приватный: на хосте нужен `docker login ghcr.io`
+  (токен с правом `read:packages`) или публичный пакет в настройках GitHub.
+
 ## Конфигурация (переменные окружения)
 
 | Переменная | Обязательна | По умолчанию | Описание |
