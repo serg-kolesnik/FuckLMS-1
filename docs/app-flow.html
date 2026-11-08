@@ -70,16 +70,19 @@
   <div class="container">
     <h1>FuckLMS — схема работы приложения</h1>
     <p>
-      Приложение состоит из трёх вкладок — <b>«Сканер»</b>, <b>«Браузер»</b> и <b>«Аккаунты»</b>.
-      После сканирования QR-кода встроенный браузер (<code>WebView</code>) автоматически входит в Moodle LMS
-      и отмечает присутствие по очереди для каждого выбранного аккаунта, используя JavaScript-инъекции.
+      Целевая архитектура (<a href="adr/0001-go-attendance-service.md">ADR 0001</a>):
+      приложение состоит из трёх вкладок — <b>«Сканер»</b>, <b>«Отметка»</b> и <b>«Аккаунты»</b> —
+      и является клиентом отдельного <b>Go-сервиса</b>. Студенты хранятся в PostgreSQL на сервисе;
+      сервис сам входит в Moodle LMS и отмечает присутствие параллельно для всех выбранных
+      студентов, отправляя результаты потоком <code>Server-Sent Events</code>.
+      Прежняя WebView-автоматизация и локальное хранение аккаунтов удалены.
     </p>
 
     <h2>Компоненты</h2>
     <table>
       <tr>
         <th>Компонент</th>
-        <th>Файл</th>
+        <th>Где</th>
         <th>Технология</th>
         <th>Роль</th>
       </tr>
@@ -87,64 +90,81 @@
         <td>Сканер QR</td>
         <td><code>MainActivity.kt</code> → <code>ScannerScreen()</code></td>
         <td>CameraX + ML Kit Barcode</td>
-        <td>Считывает QR-код и передаёт ссылку во «Браузер»</td>
+        <td>Считывает QR-код и передаёт сырую ссылку на экран «Отметка»</td>
       </tr>
       <tr>
-        <td>Встроенный браузер</td>
-        <td><code>MainActivity.kt</code> → <code>BrowserScreen()</code></td>
-        <td>WebView + JS-инъекции</td>
-        <td>Логин и отметка присутствия для каждого аккаунта</td>
+        <td>Экран отметки</td>
+        <td><code>MainActivity.kt</code> → <code>MarkingScreen()</code></td>
+        <td>OkHttp + разбор SSE-потока</td>
+        <td>Отправляет <code>POST /api/mark</code> и показывает живой статус по каждому студенту</td>
       </tr>
       <tr>
-        <td>Аккаунты</td>
-        <td><code>AccountManager.kt</code></td>
-        <td>EncryptedSharedPreferences (AES-256)</td>
-        <td>Шифрованное хранение логинов/паролей, выбор галочками</td>
+        <td>Аккаунты (студенты)</td>
+        <td><code>MainActivity.kt</code> → <code>AccountsScreen()</code></td>
+        <td>CRUD-запросы к сервису</td>
+        <td>Список студентов из БД сервиса, галочки <code>isSelected</code></td>
       </tr>
       <tr>
-        <td>HTTP-клиент (не подключён к UI)</td>
-        <td><code>MoodleClient.kt</code></td>
-        <td>OkHttp + разбор HTML</td>
-        <td>Программный аналог браузерного сценария</td>
+        <td>Настройки сервиса</td>
+        <td>EncryptedSharedPreferences (отдельный ключ)</td>
+        <td>AES-256</td>
+        <td>Только URL сервиса и bearer-токен; пароли на телефоне не хранятся</td>
+      </tr>
+      <tr>
+        <td><b>Go-сервис</b></td>
+        <td><code>server/</code></td>
+        <td>net/http, пул воркеров</td>
+        <td>CRUD студентов, параллельный логин и отметка в Moodle, SSE-стрим результатов</td>
+      </tr>
+      <tr>
+        <td>База данных</td>
+        <td><code>server/migrations/0001_init.sql</code></td>
+        <td>PostgreSQL, таблица <code>students</code></td>
+        <td>Единственное хранилище аккаунтов (имя, фамилия, группа, lms_login, lms_password)</td>
       </tr>
     </table>
 
     <h2>Основной поток</h2>
     <div class="mermaid">
 flowchart TD
-    Start([Пользователь открывает приложение]) --> Acc["«Аккаунты»: добавить логин/пароль,<br/>отметить нужные аккаунты галочками"]
-    Acc --> Scan["«Сканер»: навести камеру на QR-код"]
-    Scan --> Qr["QR-ссылка:<br/>mod/attendance/attendance.php?sessid=…&qrpass=…"]
-    Qr --> Browser["«Браузер» — BrowserScreen,<br/>список выбранных аккаунтов"]
+    Start([Пользователь открывает приложение]) --> Cfg["Настройки: URL сервиса + bearer-токен<br/>(вводятся один раз)"]
+    Cfg --> Acc["«Аккаунты»: список студентов из БД сервиса<br/>GET /api/students — без паролей"]
+    Acc --> Edit["Добавить / изменить студента<br/>POST /api/students, PUT /api/students/id<br/>(имя, фамилия, группа, lms_login, lms_password)"]
+    Edit --> Sel["Отметить галочками (isSelected),<br/>кого отмечать"]
+    Sel --> Scan["«Сканер»: навести камеру на QR-код"]
+    Scan --> Qr["QR-ссылка:<br/>attendance.php?sessid=…&qrpass=…"]
+    Qr --> Mark["«Отметка» — MarkingScreen:<br/>POST /api/mark {qrUrl, studentIds?}"]
 
-    Browser --> Loop[["Цикл: следующий выбранный аккаунт"]]
-    Loop --> Clear["Очистить cookies WebView<br/>(свежая сессия для аккаунта)"]
-    Clear --> Load[Загрузить QR-ссылку в WebView]
-    Load --> Page{"Какая страница открылась?"}
+    Mark --> Parse["Сервис: разобрать qrUrl — sessid, qrpass<br/>(host только lms.uni-dubna.ru);<br/>выбрать студентов: список или все isSelected"]
+    Parse --> Pool[["Пул воркеров (лимит конкурентности,<br/>по умолчанию 5)"]]
 
-    Page -- "login/index.php" --> LoginJs["JS: заполнить #username и #password,<br/>нажать #loginbtn"]
-    LoginJs --> Load
+    Pool --> Per[["Для каждого студента параллельно:<br/>отдельный http.Client + cookie jar"]]
+    Per --> Login["GET login/index.php → logintoken<br/>POST логина → cookies MoodleSession"]
+    Login --> Page["GET attendance.php?sessid=…&qrpass=…"]
+    Page --> Already{"Текст содержит<br/>«уже была отмечена» /<br/>«already been marked»?"}
+    Already -- Да --> EvAlready["SSE result:<br/>status = already"]
+    Already -- Нет --> Sess["Извлечь sesskey, выбрать radio<br/>«присутствовал» по подписи<br/>(не хардкод status=1)"]
+    Sess --> Post["POST attendance.php?sessid=…&mark=1<br/>(sessid, sesskey, status, studentpassword)"]
+    Post --> Res{"Ответ Moodle"}
+    Res -- "saved / сохранено" --> EvOk["SSE result:<br/>status = success"]
+    Res -- "already / уже отмечен" --> EvAlready2["SSE result:<br/>status = already"]
+    Res -- прочее --> EvErr["SSE result:<br/>status = error (поток продолжается)"]
 
-    Page -- "attendance.php" --> Already{"Текст содержит «уже была отмечена» /<br/>«already been marked»?"}
-    Already -- Да --> SuccessUrl
-    Already -- Нет --> MarkJs["JS: выбрать radio со статусом<br/>«присутствовал» (или первый),<br/>подставить qrpass в studentpassword,<br/>нажать кнопку Save"]
-    MarkJs --> Post[POST формы отметки]
-    Post --> SuccessUrl["Страница view.php?…&success=true"]
-
-    Page -- "success=true / view.php" --> Done["Статус: «Успех! Переход…»,<br/>пауза 1,5 с"]
-    Page -- прочая --> Retry["Статус: «Редирект…»<br/>повторная загрузка QR-ссылки"]
-    Retry --> Load
-
-    SuccessUrl --> Done
-    Done --> More{"Остались аккаунты?"}
-    More -- Да --> Loop
-    More -- Нет --> Finish(["Все выбранные аккаунты отмечены!"])
+    EvAlready --> Stream["Поток text/event-stream:<br/>event: result … event: done<br/>+ heartbeat : ping"]
+    EvOk --> Stream
+    EvAlready2 --> Stream
+    EvErr --> Stream
+    Stream --> UI["MarkingScreen: живой список<br/>«логин → статус» по мере готовности"]
+    UI --> Done["event: done → сводка:<br/>успешно / уже были / ошибки"]
+    Done --> Finish(["Все результаты показаны"])
     </div>
 
     <p style="margin-top: 16px;">
-      Пароль из QR-кода извлекается функцией <code>parseQrPassword()</code> — она читает только
-      параметр <code>qrpass</code>. Полный разбор QR (<code>sessid</code> + альтернативные имена пароля)
-      реализован в <code>QrParser.kt</code>, но сейчас в UI не используется.
+      Пароль из QR-кода и <code>sessid</code> извлекает <b>сервис</b> (приоритет параметров:
+      <code>qrpass</code> → <code>password</code> → <code>studentpassword</code>). Приложение
+      передаёт сырую ссылку целиком. Статусы: <code>success</code> — отмечено,
+      <code>already</code> — уже было отмечено раньше (считается успехом), <code>error</code> —
+      сбой этого студента, остальные продолжают обрабатываться.
     </p>
   </div>
 
