@@ -18,6 +18,7 @@ defaults:
 
 jobs:
 
+  # Сборка проекта
   lint-and-test:
     runs-on: ubuntu-latest
 
@@ -85,6 +86,7 @@ jobs:
               }
           }'
 
+  # Создание docker image
   build-and-push:
     # Образ публикуем только после зелёных lint/test и только на push в dev:
     # публикация из PR перезаписывала бы тег latest до мерджа.
@@ -123,6 +125,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Деплой на сервер
   deploy-to-dev-server:
     needs: build-and-push
     runs-on: ubuntu-latest

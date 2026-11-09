@@ -25,27 +25,26 @@ on:
       - '.github/workflows/android-ci.yml'
 
 jobs:
-
   build-and-test:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Клонируем репозиторий
+      # 1. Клонируем репозиторий (исправлено на стабильную v4)
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
-      # 2. Настраиваем Java (нужную для Android и Gradle)
+      # 2. Настраиваем Java (исправлено на стабильную v4)
       - name: Set up SDK
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # 3. Настраиваем официальное кэширование Grandle для ускорения сборки
+      # 3. Настраиваем кэширование Gradle
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # 4 Определяем тиип сборки (dev или release) на основе текущей ветки
+      # 4. Определяем тип сборки (dev или release) на основе текущей ветки
       - name: Set Build Environment
         id: env
         run: |
@@ -68,24 +67,23 @@ jobs:
       - name: Build Debug APK
         run: ./gradlew assembleDebug
 
-      # 7. Выгружаем APK как артефакт — скачивается со страницы запуска workflow
+      # 7. Загружаем стандартный собранный APK файл
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: app-${{ env.BUILD_TYPE }}-apk
-          path: app/build/outputs/apk/debug/app-${{ env.BUILD_TYPE }}-${{ github.run_number }}.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
 
   # Автоматическая публикация в Releases
   release:
     needs: build-and-test
     runs-on: ubuntu-latest
-    # Публикуем релиз только при пуше в ветку master (или main)
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')
     permissions:
       contents: write # Требуется для создания релиза и загрузки файлов
 
     steps:
-      # 1. Чекаутим код, чтобы экшен релиза имел доступ к репозиторию
+      # 1. Чекаутим код
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -102,21 +100,26 @@ jobs:
             echo "IS_PRERELEASE=true" >> $GITHUB_ENV
           fi
 
-      # 2. Скачиваем артефакт APK, который собрала предыдущая джоба
+      # 2. Скачиваем артефакт APK
       - name: Download APK artifact
         uses: actions/download-artifact@v4
         with:
           name: app-${{ env.BUILD_TYPE }}-apk
           path: app/build/outputs/apk/debug/
 
-      # 3. Создаем релиз на GitHub и прикрепляем APK
+      # 3. Переименовываем скачанный файл под нужный формат для релиза
+      - name: Rename APK for Release
+        run: |
+          mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/app-${{ env.BUILD_TYPE }}-${{ github.run_number }}.apk
+
+      # 4. Создаем релиз на GitHub и прикрепляем переименованный APK
       - name: Release APK
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_PREFIX }}1.0.${{ github.run_number }}
           name: "App Build (${{ env.BUILD_TYPE }}) v1.0.${{ github.run_number }}"
           body: "Автоматическая сборка из ветки **${{ github.ref_name }}**.\nТип сборки: `${{ env.BUILD_TYPE }}`\nНомер билда (versionCode): `${{ github.run_number }}`."
-          prerelease: ${{ env.IS_PRERELEASE }} # Если это dev, GitHub автоматически отметит релиз как Pre-release (предварительный)
+          prerelease: ${{ env.IS_PRERELEASE }}
           files: app/build/outputs/apk/debug/app-${{ env.BUILD_TYPE }}-${{ github.run_number }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
