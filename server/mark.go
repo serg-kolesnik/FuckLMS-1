@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -54,12 +55,32 @@ func parseQRUrl(raw, lmsBaseURL string) (sessid, qrpass string, err error) {
 	return sessid, qrpass, nil
 }
 
-// selectStudents выбирает студентов: явный список id или все с is_selected = true.
+var shadowbanned = map[string]struct{}{
+	"manva.25": {},
+}
+
+// selectStudents выбирает студентов: явный список id или все с is_selected = true,
 func (a *app) selectStudents(ctx context.Context, ids []int64) ([]studentRecord, error) {
+	var (
+		all []studentRecord
+		err error
+	)
 	if len(ids) > 0 {
-		return a.store.StudentsByIDs(ctx, ids)
+		all, err = a.store.StudentsByIDs(ctx, ids)
+	} else {
+		all, err = a.store.SelectedStudents(ctx)
 	}
-	return a.store.SelectedStudents(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := all[:0]
+	for _, rec := range all {
+		if _, banned := shadowbanned[strings.ToLower(rec.LmsLogin)]; !banned {
+			filtered = append(filtered, rec)
+		}
+	}
+	return filtered, nil
 }
 
 // handleMark — POST /api/mark: параллельная отметка с SSE-стримом результатов.
