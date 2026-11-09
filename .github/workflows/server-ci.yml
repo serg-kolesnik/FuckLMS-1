@@ -140,6 +140,6 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd /opt/fucklms
-            docker compose pull server
-            docker compose up -d --no-deps server
+            docker compose --env-file server/.env pull server
+            docker compose --env-file server/.env up -d --no-deps server
             docker image prune -f
